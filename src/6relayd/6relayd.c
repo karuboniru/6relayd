@@ -194,11 +194,6 @@ int main(int argc, char *const argv[]) {
   if (argc - optind < 1)
     return print_usage(argv[0]);
 
-  if (getuid() != 0) {
-    syslog(LOG_ERR, "Must be run as root. stopped.");
-    return 2;
-  }
-
   if ((epoll = epoll_create1(EPOLL_CLOEXEC)) < 0) {
     syslog(LOG_ERR, "Unable to open epoll: %s", strerror(errno));
     return 2;
