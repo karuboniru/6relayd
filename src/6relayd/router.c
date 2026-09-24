@@ -27,7 +27,7 @@
 #include "list.h"
 #include "router.h"
 
-static void forward_router_solicitation(const struct relayd_interface *iface);
+static ssize_t forward_router_solicitation(const struct relayd_interface *iface);
 static void forward_router_advertisement(uint8_t *data, size_t len);
 static int open_icmpv6_socket(struct icmp6_filter *filt,
                               struct ipv6_mreq *slave_mreq);
@@ -441,15 +441,15 @@ static void send_router_advert(struct relayd_event *event) {
 }
 
 // Forward router solicitation
-static void forward_router_solicitation(const struct relayd_interface *iface) {
+static ssize_t forward_router_solicitation(const struct relayd_interface *iface) {
   struct icmp6_hdr rs = {ND_ROUTER_SOLICIT, 0, 0, {{0}}};
   struct iovec iov = {&rs, sizeof(rs)};
   struct sockaddr_in6 all_routers = {AF_INET6, 0, 0, ALL_IPV6_ROUTERS,
                                      iface->ifindex};
 
   syslog(LOG_NOTICE, "Sending RS to %s", iface->ifname);
-  relayd_forward_packet(router_discovery_event.socket, &all_routers, &iov, 1,
-                        iface);
+  return relayd_forward_packet(router_discovery_event.socket, &all_routers, &iov, 1,
+                               iface);
 }
 
 // Handler for incoming router solicitations on slave interfaces
@@ -512,4 +512,17 @@ static void forward_router_advertisement(uint8_t *data, size_t len) {
     relayd_forward_packet(router_discovery_event.socket, &all_nodes, &iov, 1,
                           &config->slaves[i]);
   }
+}
+
+int relayd_router_recover(const struct relayd_interface *iface) {
+  if (!config->enable_router_discovery_relay)
+    return 0;
+  const struct in6_addr nodes = ALL_IPV6_NODES, routers = ALL_IPV6_ROUTERS;
+  if (relayd_rejoin_group(router_discovery_event.socket,
+                          iface == &config->master ? &nodes : &routers,
+                          iface->ifindex) < 0)
+    return -1;
+  if (iface == &config->master && !config->enable_router_discovery_server)
+    return forward_router_solicitation(iface) < 0 ? -1 : 0;
+  return 0;
 }

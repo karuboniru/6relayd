@@ -433,3 +433,14 @@ static void relay_client_request(struct sockaddr_in6 *source, const void *data,
   relayd_forward_packet(dhcpv6_event.socket, &dhcpv6_servers, iov, 2,
                         &config->master);
 }
+
+int relayd_dhcpv6_recover(const struct relayd_interface *iface) {
+  if (!config->enable_dhcpv6_relay || iface == &config->master)
+    return 0;
+  const struct in6_addr relays = ALL_DHCPV6_RELAYS, servers = ALL_DHCPV6_SERVERS;
+  if (relayd_rejoin_group(dhcpv6_event.socket, &relays, iface->ifindex) < 0)
+    return -1;
+  if (config->enable_dhcpv6_server)
+    return relayd_rejoin_group(dhcpv6_event.socket, &servers, iface->ifindex);
+  return 0;
+}

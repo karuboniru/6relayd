@@ -199,3 +199,50 @@ void relayd_deinit_netlink(void) {
     close(command_socket);
   command_socket = -1;
 }
+
+// Replay only routes retained in this process's ownership ledger.
+int relayd_recover_routes(int ifindex) {
+  int status = 0;
+  struct owned_route *r;
+  list_for_each_entry(r, &routes, head) {
+    if (r->request.ifindex != (unsigned)ifindex)
+      continue;
+    struct route_request req = r->request;
+    req.nh.nlmsg_type = RTM_NEWROUTE;
+    req.nh.nlmsg_flags = NLM_F_CREATE | NLM_F_EXCL;
+    if (relayd_netlink_request(&req.nh) < 0 && errno != EEXIST) {
+      syslog(LOG_WARNING, "Unable to recover route on interface %d: %s",
+             ifindex, strerror(errno));
+      status = -1;
+    }
+  }
+  return status;
+}
+
+int relayd_lost_route_interface(const struct nlmsghdr *nh) {
+  if (nh->nlmsg_type != RTM_DELROUTE ||
+      NLMSG_PAYLOAD(nh, 0) < sizeof(struct rtmsg))
+    return 0;
+  const struct rtmsg *rt = NLMSG_DATA(nh);
+  if (rt->rtm_family != AF_INET6 || rt->rtm_protocol != route_protocol)
+    return 0;
+  struct in6_addr dst = IN6ADDR_ANY_INIT;
+  uint32_t ifindex = 0, table = rt->rtm_table;
+  int len = RTM_PAYLOAD(nh);
+  for (struct rtattr *a = RTM_RTA(rt); RTA_OK(a, len); a = RTA_NEXT(a, len)) {
+    if (a->rta_type == RTA_DST && RTA_PAYLOAD(a) >= sizeof(dst))
+      memcpy(&dst, RTA_DATA(a), sizeof(dst));
+    if (a->rta_type == RTA_OIF && RTA_PAYLOAD(a) >= sizeof(ifindex))
+      memcpy(&ifindex, RTA_DATA(a), sizeof(ifindex));
+    if (a->rta_type == RTA_TABLE && RTA_PAYLOAD(a) >= sizeof(table))
+      memcpy(&table, RTA_DATA(a), sizeof(table));
+  }
+  struct owned_route *r;
+  list_for_each_entry(r, &routes, head) {
+    if (r->request.ifindex == ifindex && r->request.table == table &&
+        r->request.rtm.rtm_dst_len == rt->rtm_dst_len &&
+        IN6_ARE_ADDR_EQUAL(&r->request.dst, &dst))
+      return ifindex;
+  }
+  return 0;
+}

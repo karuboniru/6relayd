@@ -73,7 +73,11 @@ int init_ndp_proxy(const struct relayd_config *relayd_config) {
     return -1;
 
   // Receive netlink neighbor and ip-address events
-  uint32_t group = RTNLGRP_IPV6_IFADDR;
+  uint32_t group = RTNLGRP_LINK;
+  if (setsockopt(rtnl_event.socket, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP,
+                 &group, sizeof(group)) < 0)
+    return -1;
+  group = RTNLGRP_IPV6_IFADDR;
   setsockopt(rtnl_event.socket, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group,
              sizeof(group));
   group = RTNLGRP_IPV6_ROUTE;
@@ -289,8 +293,28 @@ static void handle_solicit(void *addr, void *data, size_t len,
 
 static void setup_route(struct in6_addr *addr, struct relayd_interface *iface,
                         bool add) {
-  if (iface && config->enable_route_learning)
-    relayd_setup_route(addr, 128, iface, NULL, add);
+  if (iface && config->enable_route_learning) {
+    if (add && relayd_recovery_paused(iface))
+      return;
+    if (relayd_setup_route(addr, 128, iface, NULL, add) < 0)
+      relayd_recovery_request(iface);
+  }
+}
+
+int relayd_ndp_recover(const struct relayd_interface *iface, bool probe) {
+  int status = 0;
+  struct ndp_neighbor *n;
+  list_for_each_entry(n, &neighbors, head) {
+    if (n->iface != iface || n->len != 128)
+      continue;
+    if (config->enable_route_learning &&
+        relayd_setup_route(&n->addr, 128, iface, NULL, true) < 0)
+      status = -1;
+    // Revalidate hosts whose kernel neighbor entries were flushed by a reset.
+    if (probe && ping6(&n->addr, iface) < 0)
+      status = -1;
+  }
+  return status;
 }
 
 static void free_neighbor(struct ndp_neighbor *n) {
@@ -381,6 +405,7 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
                              _unused struct relayd_interface *iface) {
   for (struct nlmsghdr *nh = data; NLMSG_OK(nh, len);
        nh = NLMSG_NEXT(nh, len)) {
+    relayd_recovery_event(nh);
     if (nh->nlmsg_type == NLMSG_DONE || nh->nlmsg_type == NLMSG_ERROR) {
       if (nh->nlmsg_type == NLMSG_ERROR &&
           NLMSG_PAYLOAD(nh, 0) >= sizeof(struct nlmsgerr)) {
@@ -450,6 +475,10 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
              (ndm->ndm_state & (NUD_REACHABLE | NUD_STALE | NUD_DELAY |
                                 NUD_PROBE | NUD_PERMANENT | NUD_NOARP)));
 
+    if (!is_addr && nh->nlmsg_type == RTM_DELNEIGH &&
+        relayd_recovery_preserve_neighbor(iface))
+      continue;
+
     if (config->enable_ndp_relay)
       modify_neighbor(addr, iface, add);
 
@@ -468,12 +497,16 @@ static void handle_rtnetlink(_unused void *addr, void *data, size_t len,
 
       for (size_t i = 0; i < config->slavecount; ++i) {
         ifa->ifa_index = config->slaves[i].ifindex;
+        if (add && relayd_recovery_paused(&config->slaves[i]))
+          continue;
         if (relayd_netlink_request(nh) < 0) {
+          int error = errno;
+          relayd_recovery_request(&config->slaves[i]);
           char ipbuf[INET6_ADDRSTRLEN];
           inet_ntop(AF_INET6, addr, ipbuf, sizeof(ipbuf));
           syslog(LOG_ERR, "Unable to %s address %s on %s: %s",
                  add ? "set" : "delete", ipbuf, config->slaves[i].ifname,
-                 strerror(errno));
+                 strerror(error));
         }
       }
     }

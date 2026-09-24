@@ -72,6 +72,7 @@ struct relayd_ipaddr {
   uint8_t prefix;
   uint32_t preferred;
   uint32_t valid;
+  uint32_t flags;
 };
 
 struct relayd_interface {
@@ -146,6 +147,20 @@ struct nlmsghdr;
 int relayd_init_netlink(uint8_t protocol);
 int relayd_netlink_request(struct nlmsghdr *request);
 void relayd_deinit_netlink(void);
+int relayd_recover_routes(int ifindex);
+int relayd_lost_route_interface(const struct nlmsghdr *nh);
+
+int relayd_init_recovery(const struct relayd_config *config);
+void relayd_deinit_recovery(void);
+void relayd_recovery_event(const struct nlmsghdr *nh);
+void relayd_recovery_request(const struct relayd_interface *iface);
+bool relayd_recovery_error(const struct relayd_interface *iface, int error);
+bool relayd_recovery_paused(const struct relayd_interface *iface);
+bool relayd_recovery_preserve_neighbor(const struct relayd_interface *iface);
+int relayd_ndp_recover(const struct relayd_interface *iface, bool probe);
+int relayd_router_recover(const struct relayd_interface *iface);
+int relayd_dhcpv6_recover(const struct relayd_interface *iface);
+int relayd_rejoin_group(int socket, const struct in6_addr *group, int ifindex);
 
 // Exported module initializers
 int init_router_discovery_relay(const struct relayd_config *relayd_config);

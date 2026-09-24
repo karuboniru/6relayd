@@ -210,6 +210,9 @@ int main(int argc, char *const argv[]) {
     return 2;
   }
 
+  struct timeval rtnl_timeout = {1, 0};
+  setsockopt(rtnl_socket, SOL_SOCKET, SO_RCVTIMEO, &rtnl_timeout, sizeof(rtnl_timeout));
+
   if (open_interface(&config.master, argv[optind++], false))
     return 3;
 
@@ -233,6 +236,9 @@ int main(int argc, char *const argv[]) {
   sigaction(SIGUSR1, &sa, NULL);
 
   if (relayd_init_netlink(config.route_proto))
+    return 4;
+
+  if (relayd_init_recovery(&config))
     return 4;
 
   if (init_router_discovery_relay(&config))
@@ -283,6 +289,7 @@ int main(int argc, char *const argv[]) {
 
   syslog(LOG_WARNING, "Termination requested by signal.");
 
+  relayd_deinit_recovery();
   deinit_ndp_proxy();
   deinit_router_discovery_relay();
   relayd_deinit_netlink();
@@ -479,10 +486,13 @@ ssize_t relayd_forward_packet(int socket, struct sockaddr_in6 *dest,
   inet_ntop(AF_INET6, &dest->sin6_addr, ipbuf, sizeof(ipbuf));
 
   ssize_t sent = sendmsg(socket, &msg, MSG_DONTWAIT);
-  if (sent < 0)
-    syslog(LOG_WARNING, "Failed to relay to %s%%%s (%s)", ipbuf, iface->ifname,
-           strerror(errno));
-  else
+  if (sent < 0) {
+    int error = errno;
+    if (relayd_recovery_error(iface, error))
+      syslog(LOG_WARNING, "Failed to relay to %s%%%s (%s)", ipbuf, iface->ifname,
+             strerror(error));
+    errno = error;
+  } else
     syslog(LOG_NOTICE, "Relayed %li bytes to %s%%%s", (long)sent, ipbuf,
            iface->ifname);
   return sent;
@@ -492,65 +502,78 @@ ssize_t relayd_forward_packet(int socket, struct sockaddr_in6 *dest,
 ssize_t relayd_get_interface_addresses(int ifindex, struct relayd_ipaddr *addrs,
                                        size_t cnt) {
   struct {
-    struct nlmsghdr nhm;
+    struct nlmsghdr nh;
     struct ifaddrmsg ifa;
   } req = {
       {sizeof(req), RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, ++rtnl_seq, 0},
-      {AF_INET6, 0, 0, 0, ifindex}};
-  if (send(rtnl_socket, &req, sizeof(req), 0) < (ssize_t)sizeof(req))
-    return 0;
-
-  uint8_t buf[8192];
-  ssize_t len = 0, ret = 0;
-
-  for (struct nlmsghdr *nhm = NULL;; nhm = NLMSG_NEXT(nhm, len)) {
-    while (len < 0 || !NLMSG_OK(nhm, (size_t)len)) {
-      len = recv(rtnl_socket, buf, sizeof(buf), 0);
-      nhm = (struct nlmsghdr *)buf;
-      if (len < 0 || !NLMSG_OK(nhm, (size_t)len)) {
-        if (errno == EINTR)
-          continue;
-        else
-          return ret;
-      }
+      {.ifa_family = AF_INET6}};
+  if (send(rtnl_socket, &req, sizeof(req), 0) < 0)
+    return -1;
+  ssize_t ret = 0;
+  for (;;) {
+    union {
+      struct nlmsghdr align;
+      uint8_t bytes[RELAYD_BUFFER_SIZE];
+    } buf;
+    struct iovec iov = {buf.bytes, sizeof(buf.bytes)};
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+    ssize_t len = recvmsg(rtnl_socket, &msg, 0);
+    if (len < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
     }
-
-    if (nhm->nlmsg_type != RTM_NEWADDR)
-      break;
-
-    // Skip address but keep clearing socket buffer
-    if (ret >= (ssize_t)cnt)
-      continue;
-
-    struct ifaddrmsg *ifa = NLMSG_DATA(nhm);
-    if (ifa->ifa_scope != RT_SCOPE_UNIVERSE ||
-        ifa->ifa_index != (unsigned)ifindex)
-      continue;
-
-    struct rtattr *rta = (struct rtattr *)&ifa[1];
-    size_t alen = NLMSG_PAYLOAD(nhm, sizeof(*ifa));
-    memset(&addrs[ret], 0, sizeof(addrs[ret]));
-    addrs[ret].prefix = ifa->ifa_prefixlen;
-
-    while (RTA_OK(rta, alen)) {
-      if (rta->rta_type == IFA_ADDRESS) {
-        memcpy(&addrs[ret].addr, RTA_DATA(rta), sizeof(struct in6_addr));
-      } else if (rta->rta_type == IFA_CACHEINFO) {
-        struct ifa_cacheinfo *ifc = RTA_DATA(rta);
-        addrs[ret].preferred = ifc->ifa_prefered;
-        addrs[ret].valid = ifc->ifa_valid;
-      }
-
-      rta = RTA_NEXT(rta, alen);
+    if (msg.msg_flags & MSG_TRUNC) {
+      errno = EMSGSIZE;
+      return -1;
     }
-
-    if (ifa->ifa_flags & IFA_F_DEPRECATED)
-      addrs[ret].preferred = 0;
-
-    ++ret;
+    for (struct nlmsghdr *nh = (void *)buf.bytes; NLMSG_OK(nh, len);
+         nh = NLMSG_NEXT(nh, len)) {
+      if (nh->nlmsg_seq != req.nh.nlmsg_seq)
+        continue;
+      if (nh->nlmsg_type == NLMSG_ERROR || (nh->nlmsg_flags & NLM_F_DUMP_INTR)) {
+        errno = EIO;
+        return -1;
+      }
+      if (nh->nlmsg_type == NLMSG_DONE) {
+        int error = 0;
+        if (NLMSG_PAYLOAD(nh, 0) >= sizeof(error))
+          memcpy(&error, NLMSG_DATA(nh), sizeof(error));
+        if (error) {
+          errno = -error;
+          return -1;
+        }
+        return ret;
+      }
+      if (nh->nlmsg_type != RTM_NEWADDR || NLMSG_PAYLOAD(nh, 0) < sizeof(struct ifaddrmsg))
+        continue;
+      struct ifaddrmsg *ifa = NLMSG_DATA(nh);
+      if (ifa->ifa_family != AF_INET6 || ifa->ifa_scope != RT_SCOPE_UNIVERSE ||
+          ifa->ifa_index != (unsigned)ifindex || ret >= (ssize_t)cnt)
+        continue;
+      struct relayd_ipaddr current = {.prefix = ifa->ifa_prefixlen,
+          .flags = ifa->ifa_flags, .valid = UINT32_MAX, .preferred = UINT32_MAX};
+      bool has_address = false;
+      int alen = IFA_PAYLOAD(nh);
+      for (struct rtattr *a = IFA_RTA(ifa); RTA_OK(a, alen); a = RTA_NEXT(a, alen)) {
+        if (a->rta_type == IFA_ADDRESS && RTA_PAYLOAD(a) >= sizeof(current.addr)) {
+          memcpy(&current.addr, RTA_DATA(a), sizeof(current.addr));
+          has_address = true;
+        } else if (a->rta_type == IFA_FLAGS && RTA_PAYLOAD(a) >= sizeof(current.flags)) {
+          memcpy(&current.flags, RTA_DATA(a), sizeof(current.flags));
+        } else if (a->rta_type == IFA_CACHEINFO && RTA_PAYLOAD(a) >= sizeof(struct ifa_cacheinfo)) {
+          struct ifa_cacheinfo *cache = RTA_DATA(a);
+          current.valid = cache->ifa_valid;
+          current.preferred = cache->ifa_prefered;
+        }
+      }
+      if (!has_address || (current.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED)))
+        continue;
+      if (current.flags & IFA_F_DEPRECATED)
+        current.preferred = 0;
+      addrs[ret++] = current;
+    }
   }
-
-  return ret;
 }
 
 struct relayd_interface *relayd_get_interface_by_index(int ifindex) {

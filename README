@@ -103,8 +103,44 @@ removed. Routes left by a crashed instance may therefore require manual
 cleanup. Addresses copied to downstream interfaces retain the previous
 behavior and are not removed on shutdown.
 
-This does not implement automatic recovery after interface resets or
-re-enable IPv6 when another service disables it.
+** Basic relay recovery **
+
+NDP relay mode (-A, or -N with a master and slaves) checks IPv6 configuration
+at startup, after a link becomes usable again, after address/route deletion
+notifications, and after network-related relay failures. A relay error is a
+reason to check state, not proof that an address or route is missing.
+
+On usable configured interfaces it enforces disable_ipv6=0, accept_ra=2 on
+the master and accept_ra=0 on slaves. It restores missing downstream copies
+of currently valid upstream addresses, using their remaining lifetimes,
+and the corresponding connected prefix routes. A missing link-local address
+is recreated with an EUI-64 identifier and normal DAD. Routes installed by
+this process (including PD routes) are replayed, and learned NDP hosts are
+probed after a reset to revalidate their location. Upstream addresses and
+default routes are relearned via RS/RA; withdrawn upstream addresses are not
+resurrected from a stale cache. Existing routes are not replaced.
+
+Events are coalesced for 250 ms. Each recovery round has at most three
+attempts (1 and 2 second retry delays), followed by a 30 second cooldown if
+unsuccessful. Successful rounds are separated by at least 5 seconds; events
+within a cooldown are coalesced into one delayed check. No polling occurs
+when there is no pending work. Repeated network-error logs are limited to
+one per interface per 30 seconds. Admin-down or carrier-down interfaces
+cancel pending recovery and are never brought up by the daemon. A genuine
+down-to-up transition starts a new round immediately after coalescing.
+
+Network sysctl writes require CAP_NET_ADMIN in the interface's network
+namespace; root UID and CAP_DAC_OVERRIDE are not required. Non-root services
+can use AmbientCapabilities/CapabilityBoundingSet with CAP_NET_ADMIN,
+CAP_NET_RAW and CAP_NET_BIND_SERVICE. /proc/sys/net/ipv6/conf must remain
+writable (in particular, ProtectKernelTunables=yes prevents these writes).
+Permission failures are logged and obey the same bounded retry policy.
+
+This first recovery implementation supports resets that preserve ifindex.
+Deleting and recreating an interface with a new ifindex requires restarting
+6relayd; it logs this condition and does not configure the replacement by
+accident. It does not restore arbitrary administrator routes. Stop competing
+configuration managers from repeatedly applying a different IPv6 policy.
 
 ** Netlink integration tests **
 
@@ -113,3 +149,9 @@ Build the dynamic binary with "make -C build -B bin/6relayd", then run
 unshare, and permission to create user/network namespaces. All network
 changes are confined to disposable namespaces. The daemon is tested with
 an empty executable search path to ensure it does not invoke ip.
+
+Run "tests/run-recovery.sh" for fault-injection tests using veth pairs. This
+also requires setpriv and exercises a non-root UID with only the three
+capabilities above when invoked by a non-root user. Tests cover sysctl
+repair, address and prefix/host route loss, relay-error triggers, bounded
+retries, and both admin-down and carrier-down suppression.
