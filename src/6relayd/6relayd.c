@@ -61,8 +61,7 @@ static void relayd_receive_packets(struct relayd_event *event);
 int main(int argc, char *const argv[]) {
   memset(&config, 0, sizeof(config));
 
-  sprintf(config.route_proto, "66");
-  int RP = 0;
+  config.route_proto = 66;
 
   const char *pidfile = "/var/run/6relayd.pid";
   bool daemonize = false;
@@ -172,13 +171,18 @@ int main(int argc, char *const argv[]) {
       verbosity++;
       break;
 
-    case 'P':
-      RP = atoi(optarg);
-      if ((RP) && (RP < 256)) {
-        sprintf(config.route_proto, optarg);
+    case 'P': {
+      char *end;
+      errno = 0;
+      unsigned long protocol = strtoul(optarg, &end, 10);
+      if (errno || optarg[0] < '0' || optarg[0] > '9' || *end ||
+          protocol < 1 || protocol > 255) {
+        fprintf(stderr, "Invalid route protocol '%s': expected 1..255\n", optarg);
+        return 1;
       }
-      printf("I: Route proto set to %s\n", config.route_proto);
+      config.route_proto = protocol;
       break;
+    }
 
     default:
       return print_usage(argv[0]);
@@ -227,6 +231,9 @@ int main(int argc, char *const argv[]) {
 
   struct sigaction sa = {.sa_handler = SIG_IGN};
   sigaction(SIGUSR1, &sa, NULL);
+
+  if (relayd_init_netlink(config.route_proto))
+    return 4;
 
   if (init_router_discovery_relay(&config))
     return 4;
@@ -278,6 +285,7 @@ int main(int argc, char *const argv[]) {
 
   deinit_ndp_proxy();
   deinit_router_discovery_relay();
+  relayd_deinit_netlink();
   free(config.slaves);
   close(urandom_fd);
   return 0;
@@ -319,6 +327,7 @@ static int print_usage(const char *name) {
       "	slave prefix ~	NDP: don't proxy NDP for hosts and only\n"
       "			serve NDP for DAD and traffic to router\n"
       "\nInvocation options:\n"
+      "\t-P <protocol>\tRoute protocol number, 1..255 (default 66)\n"
       "	-p <pidfile>	Set pidfile (/var/run/6relayd.pid)\n"
       "	-d		Daemonize\n"
       "	-v		Increase logging verbosity\n"
@@ -375,12 +384,17 @@ out:
 
 int relayd_open_rtnl_socket(void) {
   int sock = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+  if (sock < 0) {
+    syslog(LOG_ERR, "Unable to open rtnetlink socket: %s", strerror(errno));
+    return -1;
+  }
 
   // Connect to the kernel netlink interface
   struct sockaddr_nl nl = {.nl_family = AF_NETLINK};
   if (connect(sock, (struct sockaddr *)&nl, sizeof(nl))) {
     syslog(LOG_ERR, "Failed to connect to kernel rtnetlink: %s",
            strerror(errno));
+    close(sock);
     return -1;
   }
 

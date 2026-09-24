@@ -122,7 +122,7 @@ struct relayd_config {
   char **static_ndp;
   size_t static_ndp_len;
 
-  char route_proto[4];
+  uint8_t route_proto;
 };
 
 // Exported main functions
@@ -138,9 +138,14 @@ int relayd_get_interface_mtu(const char *ifname);
 int relayd_get_interface_mac(const char *ifname, uint8_t mac[6]);
 struct relayd_interface *relayd_get_interface_by_index(int ifindex);
 void relayd_urandom(void *data, size_t len);
-void relayd_setup_route(const struct in6_addr *addr, int prefixlen,
-                        const struct relayd_interface *iface,
-                        const struct in6_addr *gw, bool add);
+int relayd_setup_route(const struct in6_addr *addr, int prefixlen,
+                       const struct relayd_interface *iface,
+                       const struct in6_addr *gw, bool add);
+
+struct nlmsghdr;
+int relayd_init_netlink(uint8_t protocol);
+int relayd_netlink_request(struct nlmsghdr *request);
+void relayd_deinit_netlink(void);
 
 // Exported module initializers
 int init_router_discovery_relay(const struct relayd_config *relayd_config);
@@ -148,4 +153,4 @@ int init_dhcpv6_relay(const struct relayd_config *relayd_config);
 int init_ndp_proxy(const struct relayd_config *relayd_config);
 
 void deinit_router_discovery_relay(void);
-void deinit_ndp_proxy();
+void deinit_ndp_proxy(void);
